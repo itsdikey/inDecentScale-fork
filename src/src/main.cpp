@@ -397,7 +397,9 @@ void registerBLECallbacks() {
             timer.reset();
         }
     });
-    setLCDCallback([](bool on){ //ignore the display commands
+    setLCDCallback([](bool on){ 
+        //ignore the display commands
+        return;
          if (on) scaleDisplay(0); else scaleDisplay(255);
     });
     setPoweroffCallback(poweroff);
