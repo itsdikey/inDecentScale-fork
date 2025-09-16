@@ -8,7 +8,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "ScaleBLEService.h"
+#include "TimerCommands.h"
 #include "ICON_BMP.h"
+#include "BLEIntegration.h"
 #include "BoardConfig.h"
 #include "ButtonHandler.h"
 #include "Timer.h"
@@ -41,6 +43,13 @@ void time_short_pressed();
 void time_long_pressed();
 void calibrateScale(float knownWeight);
 void poweroff();
+void wakeup();
+
+// Refactor helpers
+void loadCalibrationFactor();
+void saveCalibrationFactor(float f);
+void registerBLECallbacks();
+void showTransientMessage(const char *msg, uint32_t ms = 1000);
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 HX711 scale;
@@ -58,13 +67,21 @@ uint64_t lastStableTime = 0; // Timestamp of the last stable weight
 bool isStable = false; // Flag to indicate if weight is currently stable
 bool isTareComplete = false; // Flag to indicate if autotare has been completed
 uint64_t lastWeightIncreaseTime = 0; // Timestamp of the last weight increase
+volatile bool isCalibrating = false; // Flag to indicate calibration mode
+
+bool isConnected = false;
 
 // tasks and mutex
 SemaphoreHandle_t dataMutex;
 TaskHandle_t TaskHandle_ReadSensors = NULL;
 TaskHandle_t TaskHandle_Communication = NULL;
 volatile uint64_t powerOnTime = 0;
-#define AUTOSTANDBY 900000
+#define AUTOSTANDBY 30000
+
+// BLE defaults
+const char* deviceName = "DecentScale";
+const char* serviceUUID = "0000FFF0-0000-1000-8000-00805F9B34FB";
+const char* characteristicUUID = "0000FFF4-0000-1000-8000-00805F9B34FB";
 
 void setup() {
     Serial.begin(115200);
@@ -88,7 +105,7 @@ void setup() {
     display.display();
     scaleDisplay(0);
 
-    Serial.println("Initializing the scale");
+    Serial.println("Initializing the scale this is the new code I swear");
     scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
     delay(2000);
 
@@ -99,41 +116,37 @@ void setup() {
     }
 
     // Initialize preferences (NVS) and load calibration factor
-    preferences.begin("smartscales", false);
-    factor = preferences.getFloat("calibrationFactor", factor);
-
-    // Validate loaded factor: reject NaN or non-positive values
-    if (std::isnan(factor) || factor <= 0.0f) {
-        Serial.println("Invalid calibration factor in NVS; restoring default.");
-        factor = 642.6133f; // default calibration factor
-        // write default back immediately
-        preferences.putFloat("calibrationFactor", factor);
-    }
-
-    Serial.printf("Calibration factor: %.4f\n", factor);
-
-    // close NVS namespace until needed; reopen when saving
-    preferences.end();
+    loadCalibrationFactor();
 
     xTaskCreate(taskReadSensors, "ReadSensors", 4096, NULL, 1, &TaskHandle_ReadSensors);
     xTaskCreate(taskCommunication, "Communication", 4096, NULL, 2, &TaskHandle_Communication);
+
+    // Register BLE callbacks and handlers
+    registerBLECallbacks();
 }
 
 void loop() {
     if ((esp_timer_get_time() - powerOnTime) >= (uint64_t)AUTOSTANDBY * 1000ULL) {
-        //poweroff();
+          poweroff();
     }
     delay(1000);
 }
 
 void taskCommunication(void *parameter) {
+    // Initialize BLE from integration module
+    bleInit(deviceName, serviceUUID, characteristicUUID);
+
     for (;;) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         timer_elapsed = timer.elapsedSeconds();
         scaleDisplay(1, weight, timer_elapsed);
+        // notify weight over BLE
+        
+        bleNotifyWeight((uint16_t)roundf(weight), isStable, timer_elapsed * 1000000ULL);
+
         xSemaphoreGive(dataMutex);
         ButtonHandler::process();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -144,42 +157,18 @@ void taskReadSensors(void *parameter) {
     scale.tare();
     for (;;) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (scale.wait_ready_timeout(200)) {
-            weight = scale.get_units(NUM_SAMPLE_AVG);
+        if (!isCalibrating) {
+            if (scale.wait_ready_timeout(200)) {
+                weight = scale.get_units(NUM_SAMPLE_AVG);
+            }
         }
         xSemaphoreGive(dataMutex);
-         if (smartfunctionOn){
-        // if (!isStable && (esp_timer_get_time() - lastStableTime) >= STABILITY_DURATION * 1000) {
-        //     // Check if weight has remained stable for a certain duration
-        //     if (fabs(weight - lastStableWeight) <= WEIGHT_STABILITY_THRESHOLD) {
-        //         // Weight is stable
-        //         lastStableTime = esp_timer_get_time(); // Record the time when weight became stable
-        //         isStable = true; // Mark weight as stable
-        //     }
-        // } else if (isStable && (esp_timer_get_time() - lastStableTime) >= TIMER_PAUSE_DELAY * 1000) {
-        //     // Check if weight is still stable after the pause delay
-        //     if (fabs(weight - lastStableWeight) <= WEIGHT_STABILITY_THRESHOLD) {
-        //         // Weight remains stable after the delay
-        //         // timer(2); // Pause the timer
-        //         isStable = false; // Mark weight as unstable
-        //     } else {
-        //         // Weight has changed, reset stability check
-        //         isStable = false;
-        //     }
-        // }
-        // // Check for weight increase after autotare
-        // if (isTareComplete && weight - lastStableWeight >= WEIGHT_INCREASE_THRESHOLD) {
-        //     // // Weight has increased by the threshold after autotare
-        //     // // Start the timer after a delay
-        //     // if ((esp_timer_get_time() - lastWeightIncreaseTime) >= TIMER_START_DELAY * 1000) {
-        //     //     timer(1); // Start the timer
-        //     // }}
-        // }
-        Serial.printf("Read weight: %.2f g, freeHeap=%u\n", weight, ESP.getFreeHeap());
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (smartfunctionOn){
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
     }
 }
-}
+
 
 void scaleDisplay(uint8_t mode, float weight, uint64_t time) {
     int CHAR_WIDTH, totalHeight, timerWidth, separatorWidth, weightWidth, totalWidth, startX, startY;
@@ -191,11 +180,14 @@ void scaleDisplay(uint8_t mode, float weight, uint64_t time) {
     int grams = (int)weight;
     int dec = (int)roundf((weight - (float)grams) * 10.0f);
 
-
     if(fabs(weight)>15000 || isnan(factor) || isnan(weight)){
         mode = 4;
     } else if(fabs(weight)>1000){
         mode = 5;
+    }
+    // Always show calibration message during calibration
+    if (isCalibrating) {
+        mode = 2;
     }
 
     switch(mode) {
@@ -214,6 +206,11 @@ void scaleDisplay(uint8_t mode, float weight, uint64_t time) {
             totalHeight = 8;
             
             display.clearDisplay();
+
+            if(smartfunctionOn && isConnected) {
+                display.drawBitmap(0, 0, epd_bitmap_bluetooth, 128, 32, WHITE);
+            }
+
             display.setTextSize(1);
             display.setTextColor(WHITE);
             // top row reserved (no button text)
@@ -291,18 +288,133 @@ void calibrateScale(float knownWeight) {
     const int SAMPLE_DELAY_MS = 100;
 
     scale.set_scale(1);
+    // Step 1: Ask user to remove all weight
+    display.clearDisplay();
+    display.setCursor(0, 16);
+    display.println("Remove all weight");
+    display.display();
+    delay(5000);
+
     scale.tare();
-    
-    delay(2000);
+    // Step 2: Ask user to wait after taring
+    display.clearDisplay();
+    display.setCursor(0, 16);
+    display.println("Wait after taring...");
+    display.display();
+    delay(1000);
+
+    // Step 3: Ask user to place known weight
+    display.clearDisplay();
+    display.setCursor(0, 16);
+    display.println("Place 50g weight");
+    display.display();
+    delay(5000);
 
     factor = (scale.get_units(10))/knownWeight;
     Serial.printf("New calibration factor: %.4f\n", factor);
     scale.set_scale(factor); // Set calibration factor
     // Save calibration factor to NVS: open namespace, write, then close
     preferences.begin("smartscales", false);
-    preferences.putFloat("calibrationFactor", factor);
+    preferences.putFloat("CF", factor);
     // read back immediately to verify write
-    float saved = preferences.getFloat("calibrationFactor", NAN);
-    Serial.printf("Saved calibrationFactor (readback): %.4f\n", saved);
+    float saved = preferences.getFloat("CF", NAN);
+    Serial.printf("Saved CF (readback): %.4f\n", saved);
     preferences.end();
+}
+
+void poweroff() {
+
+    // Serial.println("Powering off...");
+    // Serial.println("Power off not implemented yet");
+    // Serial.println("Returning to main loop");
+    // Serial.println("Remove this return statement when power off is implemented and external PSU is used");
+    return;
+
+    // Attach wakeup interrupt on the load cell data pin
+    attachInterrupt(digitalPinToInterrupt(LOADCELL_DOUT_PIN), wakeup, FALLING);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_TARE), wakeup, FALLING);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_TIME), wakeup, FALLING);
+    timer.reset();
+    timer.pause();
+    scaleDisplay(255); // turn off display
+    // Power down HX711 to save energy
+    scale.power_down();
+    delay(10);
+    // Enter deep sleep until DOUT pulls low (or external wake)
+    esp_deep_sleep_start();
+}
+
+void wakeup() {
+    // Detach the wakeup interrupt handler
+    detachInterrupt(digitalPinToInterrupt(LOADCELL_DOUT_PIN));
+    detachInterrupt(digitalPinToInterrupt(BUTTON_TARE));
+    detachInterrupt(digitalPinToInterrupt(BUTTON_TIME));
+    // Power up HX711 and give it time to stabilise
+    scale.power_up();
+    delay(50);
+    powerOnTime = esp_timer_get_time();
+    scaleDisplay(0); // show boot/initial screen
+}
+
+// Load calibration factor from NVS and validate it
+void loadCalibrationFactor() {
+    preferences.begin("smartscales", false);
+    factor = preferences.getFloat("CF", factor);
+    if (std::isnan(factor) || factor <= 0.0f) {
+        Serial.println("Invalid calibration factor in NVS; restoring default.");
+        factor = 642.6133f; // default calibration factor
+        preferences.putFloat("CF", factor);
+    }
+    Serial.printf("Calibration factor: %.4f\n", factor);
+    preferences.end();
+}
+
+// Save calibration factor to NVS
+void saveCalibrationFactor(float f) {
+    preferences.begin("smartscales", false);
+    preferences.putFloat("CF", f);
+    preferences.end();
+}
+
+// Helper to show a brief on-screen message
+void showTransientMessage(const char *msg, uint32_t ms) {
+    display.clearDisplay();
+    display.setCursor(0, 16);
+    display.println(msg);
+    display.display();
+    delay(ms);
+}
+
+// Register BLE callbacks and handlers (extracted from setup for clarity)
+void registerBLECallbacks() {
+    setTareCallback(tare_short_pressed);
+    setTimerCallback([](uint8_t state){ 
+        if(state == TIMER_START) {
+            timer.start();
+        } else if(state == TIMER_PAUSE) {
+            timer.pause();
+        } else if(state == TIMER_RESET) {
+            timer.reset();
+        }
+    });
+    setLCDCallback([](bool on){ //ignore the display commands
+         if (on) scaleDisplay(0); else scaleDisplay(255);
+    });
+    setPoweroffCallback(poweroff);
+    setCalibrateCallback([](){ calibrateScale(50.0f); });
+    setFactorCallback([](float f){ factor = f; saveCalibrationFactor(f); });
+
+    // Print/display on BLE connect/disconnect
+    setConnectedCallback([](){
+        Serial.println("[MAIN] BLE connected");
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        isConnected = true;
+        xSemaphoreGive(dataMutex);
+    });
+    setDisconnectedCallback([](){
+        Serial.println("[MAIN] BLE disconnected");
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        isConnected = false;
+        xSemaphoreGive(dataMutex);
+    });
 }
