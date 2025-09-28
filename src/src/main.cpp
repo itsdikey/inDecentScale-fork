@@ -17,7 +17,6 @@
 #include <stdio.h>
 #include <Preferences.h>
 #include <cmath>
-
 // Autotare/weight stability
 #define WEIGHT_STABILITY_THRESHOLD 1.0
 #define TIMER_START_DELAY 5000
@@ -25,11 +24,19 @@
 #define STABILITY_DURATION 5000
 #define TIMER_PAUSE_DELAY 2000
 #define DEBOUNCE_TIME 50
-#define NUM_SAMPLE_AVG 5
+
 #define HX711_GAIN_FACTOR 64
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
 #define OLED_RESET OLED_RESET_PIN
+//#define TEN_HZ
+#define EIGHTY_HZ
+
+#ifdef TEN_HZ
+    #define NUM_SAMPLE_AVG 5
+#elif defined(EIGHTY_HZ)
+    #define NUM_SAMPLE_AVG 8
+#endif
 
 bool smartfunctionOn = true;
 
@@ -150,6 +157,44 @@ void taskCommunication(void *parameter) {
     }
 }
 
+float weights[3];
+float temp;
+
+float getWeight(){
+    #if defined(TEN_HZ)
+    weight = scale.get_units(NUM_SAMPLE_AVG);
+    return weight;
+    #elif defined(EIGHTY_HZ)
+
+    weights[0] = scale.get_units(NUM_SAMPLE_AVG);
+    delay(5); // small delay to allow HX711 to settle
+    weights[1] = scale.get_units(NUM_SAMPLE_AVG);
+    delay(5);
+    weights[2] = scale.get_units(NUM_SAMPLE_AVG);
+    //sort weights array with just if-s
+    if(weights[0]>weights[1]){
+        temp = weights[0];
+        weights[0] = weights[1];
+        weights[1] = temp;
+    }
+    if(weights[0]>weights[2]){
+        temp = weights[0];
+        weights[0] = weights[2];
+        weights[2] = temp;
+    }
+    if(weights[1]>weights[2]){
+        temp = weights[1];
+        weights[1] = weights[2];
+        weights[2] = temp;
+    }
+
+    // low-pass filter
+    //weights[1] = (weights[1]*0.6) + (weights[0]*0.2) + (weights[2]*0.2);
+
+    return weights[1];
+    #endif
+}
+
 void taskReadSensors(void *parameter) {
     scale.set_scale(factor);
     scale.set_gain(HX711_GAIN_FACTOR);
@@ -159,7 +204,7 @@ void taskReadSensors(void *parameter) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (!isCalibrating) {
             if (scale.wait_ready_timeout(200)) {
-                weight = scale.get_units(NUM_SAMPLE_AVG);
+                weight = getWeight();
             }
         }
         xSemaphoreGive(dataMutex);
