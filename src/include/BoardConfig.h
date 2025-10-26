@@ -22,7 +22,8 @@
 #define I2C_SCL_PIN 9
 #define OLED_RESET_PIN -1
 #define BUTTON_TIME 5
-#define BUTTON_TARE 6
+#define BUTTON_TARE 1
+#define VOLTAGE_ADC_PIN 2
 
 // Helper macro to stringify board name
 #define STRINGIFY(x) #x

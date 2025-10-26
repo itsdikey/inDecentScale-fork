@@ -25,6 +25,14 @@
 #define TIMER_PAUSE_DELAY 2000
 #define DEBOUNCE_TIME 50
 
+// ADC voltage calculation
+#define ADC_SAMPLES 10
+#define ADC_VREF 3.3          // Reference voltage (3.3V for ESP32-C3)
+#define ADC_RESOLUTION 4096.0 // 12-bit ADC
+#define VOLTAGE_DIVIDER_RATIO 1.0 // Adjust if using voltage divider
+#define BATTERY_FULL_VOLTAGE 2.1  // 100% battery voltage
+#define BATTERY_EMPTY_VOLTAGE 1.5 // 0% battery voltage (adjust based on your battery)
+
 #define HX711_GAIN_FACTOR 64
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
@@ -51,6 +59,8 @@ void time_long_pressed();
 void calibrateScale(float knownWeight);
 void poweroff();
 void wakeup();
+float readVoltage();
+uint8_t getBatteryPercentage(float voltage);
 
 // Refactor helpers
 void loadCalibrationFactor();
@@ -78,12 +88,16 @@ volatile bool isCalibrating = false; // Flag to indicate calibration mode
 
 bool isConnected = false;
 
+// Voltage monitoring
+float voltage = 0.0f;
+uint8_t batteryPercentage = 100;
+
 // tasks and mutex
 SemaphoreHandle_t dataMutex;
 TaskHandle_t TaskHandle_ReadSensors = NULL;
 TaskHandle_t TaskHandle_Communication = NULL;
 volatile uint64_t powerOnTime = 0;
-#define AUTOSTANDBY 30000
+#define AUTOSTANDBY 60000
 
 // BLE defaults
 const char* deviceName = "DecentScale";
@@ -93,6 +107,15 @@ const char* characteristicUUID = "0000FFF4-0000-1000-8000-00805F9B34FB";
 void setup() {
     Serial.begin(115200);
     Serial.println("Booting...");
+    
+    // Check if we woke up from deep sleep
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO) {
+        Serial.println("Woke up from deep sleep via GPIO");
+    } else {
+        Serial.println("Normal boot or reset");
+    }
+    
     powerOnTime = esp_timer_get_time();
 
     ButtonHandler::begin();
@@ -101,6 +124,11 @@ void setup() {
     ButtonHandler::setTimeCallback(time_short_pressed);
     ButtonHandler::setTimeLongCallback(time_long_pressed);
     //ButtonHandler::setUsePolling(true);
+    
+    // Configure ADC for voltage reading
+    analogReadResolution(12); // Set ADC resolution to 12 bits
+    analogSetAttenuation(ADC_11db); // Set attenuation for 0-3.3V range
+    pinMode(VOLTAGE_ADC_PIN, INPUT);
     
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
@@ -133,6 +161,9 @@ void setup() {
 }
 
 void loop() {
+    if(timer.isRunning()) {
+        powerOnTime = esp_timer_get_time();
+    }
     if ((esp_timer_get_time() - powerOnTime) >= (uint64_t)AUTOSTANDBY * 1000ULL) {
           poweroff();
     }
@@ -150,6 +181,14 @@ void taskCommunication(void *parameter) {
         // notify weight over BLE
         
         bleNotifyWeight((uint16_t)roundf(weight), isStable, timer_elapsed * 1000000ULL);
+        
+        // Print voltage and battery percentage to serial for monitoring
+        static uint32_t lastVoltagePrint = 0;
+        uint32_t currentTime = millis();
+        if (currentTime - lastVoltagePrint >= 2000) { // Print every 2 seconds
+            Serial.printf("Voltage: %.3fV | Battery: %d%%\n", voltage, batteryPercentage);
+            lastVoltagePrint = currentTime;
+        }
 
         xSemaphoreGive(dataMutex);
         ButtonHandler::process();
@@ -159,6 +198,35 @@ void taskCommunication(void *parameter) {
 
 float weights[3];
 float temp;
+
+float readVoltage() {
+    uint32_t adcSum = 0;
+    
+    // Take multiple samples and average for better accuracy
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+        adcSum += analogRead(VOLTAGE_ADC_PIN);
+        delay(1);
+    }
+    
+    float adcAverage = (float)adcSum / ADC_SAMPLES;
+    
+    // Convert ADC value to voltage
+    float voltage = (adcAverage / ADC_RESOLUTION) * ADC_VREF * VOLTAGE_DIVIDER_RATIO;
+    
+    return voltage;
+}
+
+uint8_t getBatteryPercentage(float voltage) {
+    // Calculate battery percentage based on voltage range
+    if (voltage >= BATTERY_FULL_VOLTAGE) {
+        return 100;
+    } else if (voltage <= BATTERY_EMPTY_VOLTAGE) {
+        return 0;
+    } else {
+        float percentage = ((voltage - BATTERY_EMPTY_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_EMPTY_VOLTAGE)) * 100.0f;
+        return (uint8_t)percentage;
+    }
+}
 
 float getWeight(){
     #if defined(TEN_HZ)
@@ -206,6 +274,9 @@ void taskReadSensors(void *parameter) {
             if (scale.wait_ready_timeout(200)) {
                 weight = getWeight();
             }
+            // Read voltage from ADC and calculate battery percentage
+            voltage = readVoltage();
+            batteryPercentage = getBatteryPercentage(voltage);
         }
         xSemaphoreGive(dataMutex);
         if (smartfunctionOn){
@@ -220,8 +291,10 @@ void scaleDisplay(uint8_t mode, float weight, uint64_t time) {
     uint32_t seconds = (uint32_t)time;
     uint32_t minutes = seconds / 60;
     uint32_t secs = seconds % 60;
+    int batteryTextWidth = 0;
     char timeBuf[8];
     char weightBuf[16];
+    char batteryBuf[8];
     int grams = (int)weight;
     int dec = (int)roundf((weight - (float)grams) * 10.0f);
 
@@ -255,6 +328,14 @@ void scaleDisplay(uint8_t mode, float weight, uint64_t time) {
             if(smartfunctionOn && isConnected) {
                 display.drawBitmap(0, 0, epd_bitmap_bluetooth, 128, 32, WHITE);
             }
+
+            // Display battery percentage in top right corner
+            display.setTextSize(1);
+            display.setTextColor(WHITE);
+            snprintf(batteryBuf, sizeof(batteryBuf), "%d%%", batteryPercentage);
+            batteryTextWidth = strlen(batteryBuf) * 6; // 6 pixels per character at size 1
+            display.setCursor(128 - batteryTextWidth, 0);
+            display.print(batteryBuf);
 
             display.setTextSize(1);
             display.setTextColor(WHITE);
@@ -373,27 +454,61 @@ void poweroff() {
     // Serial.println("Power off not implemented yet");
     // Serial.println("Returning to main loop");
     // Serial.println("Remove this return statement when power off is implemented and external PSU is used");
-    return;
+    //return;
 
-    // Attach wakeup interrupt on the load cell data pin
-    attachInterrupt(digitalPinToInterrupt(LOADCELL_DOUT_PIN), wakeup, FALLING);
-    attachInterrupt(digitalPinToInterrupt(BUTTON_TARE), wakeup, FALLING);
-    attachInterrupt(digitalPinToInterrupt(BUTTON_TIME), wakeup, FALLING);
+    Serial.println("Entering deep sleep...");
+    
     timer.reset();
     timer.pause();
     scaleDisplay(255); // turn off display
+    
     // Power down HX711 to save energy
     scale.power_down();
-    delay(10);
-    // Enter deep sleep until DOUT pulls low (or external wake)
+    delay(100); // Give more time for everything to settle
+    
+    // Configure GPIO wakeup for ESP32-C3 deep sleep
+    // IMPORTANT: ESP32-C3 only supports GPIO 0-5 for deep sleep wakeup
+    // When using multiple GPIOs, combine them in a single call with OR'd bitmask
+    uint64_t wakeup_pin_mask = 0;
+    
+    // // Add LOADCELL_DOUT_PIN (GPIO 3) to wakeup mask
+    // if (LOADCELL_DOUT_PIN <= 5) {
+    //     wakeup_pin_mask |= (1ULL << LOADCELL_DOUT_PIN);
+    //     Serial.printf("Added GPIO %d (LOADCELL_DOUT) to wakeup mask\n", LOADCELL_DOUT_PIN);
+    // }
+    
+    // Add BUTTON_TARE (GPIO 1) to wakeup mask
+    if (BUTTON_TARE <= 5) {
+        wakeup_pin_mask |= (1ULL << BUTTON_TARE);
+        Serial.printf("Added GPIO %d (BUTTON_TARE) to wakeup mask\n", BUTTON_TARE);
+    }
+    
+    // Add BUTTON_TIME (GPIO 5) to wakeup mask
+    if (BUTTON_TIME <= 5) {
+        wakeup_pin_mask |= (1ULL << BUTTON_TIME);
+        Serial.printf("Added GPIO %d (BUTTON_TIME) to wakeup mask\n", BUTTON_TIME);
+    }
+    
+    // Enable wakeup with combined mask (single call)
+    if (wakeup_pin_mask > 0) {
+        esp_deep_sleep_enable_gpio_wakeup(wakeup_pin_mask, ESP_GPIO_WAKEUP_GPIO_LOW);
+        Serial.printf("Deep sleep wakeup enabled on pin mask: 0x%llx\n", wakeup_pin_mask);
+    }
+    
+    delay(100); // Give time for serial to flush
+    
+    // Enter deep sleep until GPIO wakeup
     esp_deep_sleep_start();
 }
 
 void wakeup() {
-    // Detach the wakeup interrupt handler
-    detachInterrupt(digitalPinToInterrupt(LOADCELL_DOUT_PIN));
-    detachInterrupt(digitalPinToInterrupt(BUTTON_TARE));
-    detachInterrupt(digitalPinToInterrupt(BUTTON_TIME));
+    // This function is called after waking from deep sleep
+    // Note: After deep sleep, the ESP32 actually reboots, so this function
+    // may not be directly called. Instead, setup() runs again.
+    // We keep this for manual wakeup scenarios.
+    
+    Serial.println("Waking up from sleep...");
+    
     // Power up HX711 and give it time to stabilise
     scale.power_up();
     delay(50);
