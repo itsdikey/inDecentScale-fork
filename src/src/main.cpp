@@ -92,6 +92,10 @@ bool isConnected = false;
 float voltage = 0.0f;
 uint8_t batteryPercentage = 100;
 
+// Weight change detection for power timer reset
+float lastWeightForPowerTimer = 0.0f;
+#define WEIGHT_CHANGE_THRESHOLD 1.0f  // 1g threshold
+
 // tasks and mutex
 SemaphoreHandle_t dataMutex;
 TaskHandle_t TaskHandle_ReadSensors = NULL;
@@ -273,6 +277,12 @@ void taskReadSensors(void *parameter) {
         if (!isCalibrating) {
             if (scale.wait_ready_timeout(200)) {
                 weight = getWeight();
+                
+                // Check if weight changed by more than threshold and reset power timer
+                if (fabs(weight - lastWeightForPowerTimer) > WEIGHT_CHANGE_THRESHOLD) {
+                    powerOnTime = esp_timer_get_time();
+                    lastWeightForPowerTimer = weight;
+                }
             }
             // Read voltage from ADC and calculate battery percentage
             voltage = readVoltage();
@@ -329,12 +339,11 @@ void scaleDisplay(uint8_t mode, float weight, uint64_t time) {
                 display.drawBitmap(0, 0, epd_bitmap_bluetooth, 128, 32, WHITE);
             }
 
-            // Display battery percentage in top right corner
+            // Display battery percentage in top left corner
             display.setTextSize(1);
             display.setTextColor(WHITE);
             snprintf(batteryBuf, sizeof(batteryBuf), "%d%%", batteryPercentage);
-            batteryTextWidth = strlen(batteryBuf) * 6; // 6 pixels per character at size 1
-            display.setCursor(128 - batteryTextWidth, 0);
+            display.setCursor(0, 0);  // Top left corner
             display.print(batteryBuf);
 
             display.setTextSize(1);
